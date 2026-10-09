@@ -390,4 +390,356 @@
 </div>
 
 <script>
-    const SUPABASE_URL = "
+    const SUPABASE_URL = "https://siiiifesdjuunwmwozfb.supabase.co/rest/v1";
+    const SUPABASE_KEY = "sb_publishable_ohToE8Z_Fzo87uBtzdPDIg_cqHCi3HT";
+    
+    const { createClient } = supabase;
+    const supabaseClient = createClient("https://siiiifesdjuunwmwozfb.supabase.co", SUPABASE_KEY);
+    
+    const headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": "Bearer " + SUPABASE_KEY,
+        "Content-Type": "application/json"
+    };
+
+    let allOrdersData = [];
+    let workItemsMap = {};
+    let allProductionSteps = []; 
+    let targetToStepMap = {}; 
+    let aggregatedProduction = {}; 
+    let rawStepsData = [];
+    let allTargetsData = [];
+    let isFirstLoad = true;
+
+    window.onload = async function() {
+        updateStickyColumns();
+        await fetchAllData();
+        
+        document.addEventListener('click', function(e) {
+            if (!e.target.closest('.filter-group')) {
+                document.querySelectorAll('.smart-dropdown-list').forEach(el => el.style.display = 'none');
+            }
+        });
+    };
+
+    function updateStickyColumns() {
+        const freezeCount = parseInt(document.getElementById('freeze_col').value);
+        let styleHtml = '';
+        if (freezeCount > 0) {
+            const widths = [190, 170, 140, 120, 130];
+            let currentLeft = 0;
+            for(let i = 1; i <= freezeCount; i++) {
+                styleHtml += `
+                    th:nth-child(${i}), td:nth-child(${i}) {
+                        position: sticky; left: ${currentLeft}px; min-width: ${widths[i-1]}px; background-color: var(--table-bg); z-index: 2;
+                    }
+                    thead th:nth-child(${i}) { z-index: 12; background-color: #f8fafc; }
+                `;
+                currentLeft += widths[i-1];
+            }
+        }
+        document.getElementById('dynamic-sticky-style').innerHTML = styleHtml;
+    }
+
+    function closeOrderPreview() {
+        document.getElementById('orderPreviewModal').style.display = 'none';
+    }
+
+    function printPreview() {
+        const content = document.getElementById('previewContentBody').innerHTML;
+        const printWindow = window.open('', '_blank');
+        printWindow.document.write(`<html><head><title>Preview</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body style="padding:20px;">${content}</body></html>`);
+        printWindow.document.close();
+        printWindow.focus();
+        setTimeout(() => { printWindow.print(); printWindow.close(); }, 300);
+    }
+
+    async function fetchAllData() {
+        try {
+            const [ordersRes, workItemsRes, stepsRes, targetsRes, dailyRes] = await Promise.all([
+                fetch(`${SUPABASE_URL}/orders?select=*&order=end_date.asc`, { headers, cache: 'no-store' }),
+                fetch(`${SUPABASE_URL}/work_items?select=id_work,work_code`, { headers, cache: 'no-store' }),
+                fetch(`${SUPABASE_URL}/production_steps?select=id_step,step_name&order=id_step.asc`, { headers, cache: 'no-store' }),
+                fetch(`${SUPABASE_URL}/targets?select=id_target,id_step`, { headers, cache: 'no-store' }),
+                fetch(`${SUPABASE_URL}/daily_production?select=id_order,id_target,produced_amount&limit=50000`, { headers, cache: 'no-store' })
+            ]);
+
+            if (!ordersRes.ok) throw new Error("Connection failed");
+
+            let fetchedOrders = await ordersRes.json();
+            
+            // กรองข้อมูลเฉพาะที่ is_closed มีค่าเป็น false หรือ null เพื่อแสดงเฉพาะที่ยังไม่ปิดงาน
+            allOrdersData = fetchedOrders.filter(order => !order.is_closed || String(order.is_closed).toLowerCase() === 'false');
+
+            const workItems = await workItemsRes.json();
+            rawStepsData = await stepsRes.json(); 
+            // เรียงลำดับ Level (id_step) จากน้อยไปมาก
+            rawStepsData.sort((a, b) => a.id_step - b.id_step);
+
+            allTargetsData = await targetsRes.json();
+            const dailyProduction = await dailyRes.json();
+
+            workItems.forEach(w => workItemsMap[w.id_work] = w.work_code);
+
+            let targetToStep = {};
+            allTargetsData.forEach(t => {
+                targetToStep[t.id_target] = t.id_step;
+                targetToStepMap[t.id_target] = t.id_step;
+            });
+
+            aggregatedProduction = {};
+            dailyProduction.forEach(dp => {
+                let orderId = dp.id_order;
+                let stepId = targetToStep[dp.id_target];
+                if (orderId && stepId && dp.produced_amount) {
+                    if (!aggregatedProduction[orderId]) aggregatedProduction[orderId] = {};
+                    if (!aggregatedProduction[orderId][stepId]) aggregatedProduction[orderId][stepId] = 0;
+                    aggregatedProduction[orderId][stepId] += dp.produced_amount;
+                }
+            });
+
+            let uniqueStepMap = new Map();
+            rawStepsData.forEach(step => {
+                let name = (step.step_name || "").trim();
+                if (!uniqueStepMap.has(name)) {
+                    uniqueStepMap.set(name, { step_name: name, ids: [step.id_step] });
+                } else {
+                    uniqueStepMap.get(name).ids.push(step.id_step);
+                }
+            });
+
+            // สร้าง Array ขั้นตอนทั้งหมด และดึง "แพ็คกิ้ง" มาไว้ด้านหน้าสุด
+            let tempAllSteps = Array.from(uniqueStepMap.values());
+            const packingSteps = tempAllSteps.filter(step => step.step_name.includes('แพ็คกิ้ง'));
+            const otherSteps = tempAllSteps.filter(step => !step.step_name.includes('แพ็คกิ้ง'));
+            allProductionSteps = [...packingSteps, ...otherSteps];
+
+            if(isFirstLoad) {
+                renderTableHeader();
+                isFirstLoad = false;
+            }
+            
+            applyFilters();
+            document.getElementById('syncStatus').innerHTML = '<div class="pulse-dot" style="background:#10b981;"></div> REALTIME STANDBY';
+
+        } catch (error) {
+            console.error(error);
+            document.getElementById('syncStatus').innerHTML = '<i class="fa-solid fa-triangle-exclamation text-danger"></i> DISCONNECTED';
+        }
+    }
+
+    function openOrderPreview(orderId) {
+        const order = allOrdersData.find(o => o.id_order == orderId);
+        if (!order) return;
+
+        let safeOrderNo = order.order_no || '-';
+        let workCode = workItemsMap[order.id_work] || order.id_work || '-';
+        let poNo = order.po_no || '-';
+        let orderQty = order.quantity || 0;
+        let endDate = order.end_date ? order.end_date.split('T')[0] : '-';
+
+        let html = `
+            <div class="row mb-3">
+                <div class="col-md-6">
+                    <p class="mb-1"><b>เลขที่ใบสั่ง:</b> <span class="text-primary">${safeOrderNo}</span></p>
+                    <p class="mb-1"><b>รหัสสินค้า:</b> ${workCode}</p>
+                    <p class="mb-1"><b>PO_No:</b> ${poNo}</p>
+                </div>
+                <div class="col-md-6 text-md-end">
+                    <p class="mb-1"><b>ยอดสั่งผลิต:</b> <span class="fs-5 fw-bold text-success">${parseInt(orderQty).toLocaleString()} ชิ้น</span></p>
+                    <p class="mb-1"><b>วันกำหนดเสร็จ:</b> ${endDate}</p>
+                </div>
+            </div>
+            <h5 class="border-bottom pb-2">ประวัติและสถานะการผลิตรายขั้นตอน (เรียงตามลำดับ)</h5>
+            <div class="table-responsive">
+                <table class="table table-bordered table-striped align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th>ขั้นตอนการผลิต</th>
+                            <th class="text-end">ยอดผลิตสะสม</th>
+                            <th class="text-center">เปอร์เซ็นต์สะสม (%)</th>
+                            <th class="text-center">สถานะ</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
+
+        let hasActiveSteps = false;
+        
+        // จัดเรียงในพรีวิวโดยดึงแพ็คกิ้งมาไว้บนสุดด้วย
+        let previewStepsData = [...rawStepsData];
+        const previewPacking = previewStepsData.filter(step => step.step_name.includes('แพ็คกิ้ง'));
+        const previewOther = previewStepsData.filter(step => !step.step_name.includes('แพ็คกิ้ง'));
+        previewStepsData = [...previewPacking, ...previewOther];
+
+        previewStepsData.forEach(step => {
+            let stepProduced = 0;
+            if (aggregatedProduction[order.id_order] && aggregatedProduction[order.id_order][step.id_step]) {
+                stepProduced = aggregatedProduction[order.id_order][step.id_step];
+            }
+
+            // กรองแสดงผลเฉพาะขั้นตอนที่มีจำนวนการผลิตมากกว่า 0
+            if (stepProduced > 0) {
+                hasActiveSteps = true;
+                let pct = (orderQty > 0) ? ((stepProduced / orderQty) * 100).toFixed(1) : '0.0';
+                let numPct = parseFloat(pct);
+                let badgeClass = numPct >= 100 ? 'bg-success' : (numPct >= 75 ? 'bg-warning text-dark' : (numPct >= 30 ? 'bg-info text-dark' : 'bg-danger'));
+                let statusText = numPct >= 100 ? 'เสร็จสมบูรณ์' : 'กำลังดำเนินการ';
+
+                html += `
+                    <tr>
+                        <td><b>${step.step_name}</b></td>
+                        <td class="text-end fw-bold">${stepProduced.toLocaleString()}</td>
+                        <td class="text-center fw-bold">${pct}%</td>
+                        <td class="text-center"><span class="badge ${badgeClass}">${statusText}</span></td>
+                    </tr>
+                `;
+            }
+        });
+
+        if (!hasActiveSteps) {
+            html += `<tr><td colspan="4" class="text-center text-muted py-3">ยังไม่มีประวัติการบันทึกการผลิตในใบสั่งนี้</td></tr>`;
+        }
+
+        html += `</tbody></table></div>`;
+        document.getElementById('previewContentBody').innerHTML = html;
+        document.getElementById('orderPreviewModal').style.display = 'flex';
+    }
+
+    function showSmartDropdown(type) {
+        const listContainer = document.getElementById(type === 'po' ? 'dropdown_list_po' : 'dropdown_list_work');
+        let items = [];
+        if (type === 'po') {
+            items = [...new Set(allOrdersData.map(i => i.po_no ? String(i.po_no).trim() : '').filter(Boolean))].sort();
+        } else {
+            items = [...new Set(allOrdersData.map(i => {
+                let w = workItemsMap[i.id_work] || i.id_work;
+                return w ? String(w).trim() : '';
+            }).filter(Boolean))].sort();
+        }
+        
+        let html = `<div class="smart-dropdown-item" onclick="selectSmartItem('${type}', '')">-- ทั้งหมด --</div>`;
+        items.forEach(item => {
+            html += `<div class="smart-dropdown-item" onclick="selectSmartItem('${type}', '${item}')">${item}</div>`;
+        });
+        listContainer.innerHTML = html;
+        listContainer.style.display = 'block';
+    }
+
+    function filterSmartDropdown(type) {
+        const inputVal = document.getElementById(type === 'po' ? 'filter_po' : 'filter_work').value.toLowerCase();
+        const listContainer = document.getElementById(type === 'po' ? 'dropdown_list_po' : 'dropdown_list_work');
+        let items = [];
+        if (type === 'po') {
+            items = [...new Set(allOrdersData.map(i => i.po_no ? String(i.po_no).trim() : '').filter(Boolean))];
+        } else {
+            items = [...new Set(allOrdersData.map(i => {
+                let w = workItemsMap[i.id_work] || i.id_work;
+                return w ? String(w).trim() : '';
+            }).filter(Boolean))];
+        }
+
+        const filtered = items.filter(i => i.toLowerCase().includes(inputVal));
+        let html = `<div class="smart-dropdown-item" onclick="selectSmartItem('${type}', '')">-- ทั้งหมด --</div>`;
+        filtered.forEach(item => {
+            html += `<div class="smart-dropdown-item" onclick="selectSmartItem('${type}', '${item}')">${item}</div>`;
+        });
+        listContainer.innerHTML = html;
+        listContainer.style.display = 'block';
+        applyFilters();
+    }
+
+    function selectSmartItem(type, value) {
+        document.getElementById(type === 'po' ? 'filter_po' : 'filter_work').value = value;
+        document.getElementById(type === 'po' ? 'dropdown_list_po' : 'dropdown_list_work').style.display = 'none';
+        applyFilters();
+    }
+
+    function applyFilters() {
+        const poVal = document.getElementById('filter_po').value.trim().toLowerCase();
+        const workVal = document.getElementById('filter_work').value.trim().toLowerCase();
+
+        let filtered = allOrdersData.filter(item => {
+            let safePo = item.po_no ? String(item.po_no).trim().toLowerCase() : '';
+            let safeWork = String(workItemsMap[item.id_work] || item.id_work || '').trim().toLowerCase();
+            return (!poVal || safePo.includes(poVal)) && (!workVal || safeWork.includes(workVal));
+        });
+
+        renderTable(filtered);
+    }
+
+    function clearFilters() {
+        document.getElementById('filter_po').value = '';
+        document.getElementById('filter_work').value = '';
+        applyFilters();
+    }
+
+    function renderTableHeader() {
+        const thead = document.getElementById('reportTableHead');
+        let html = `<tr><th style="padding-left:15px;">เลขที่ใบสั่ง</th><th>รหัสสินค้า</th><th>PO_NO</th><th class="text-right-col">ยอดสั่งผลิต</th><th>วันกำหนดเสร็จ</th>`;
+        allProductionSteps.forEach(step => {
+            html += `<th class="text-center-col">%${step.step_name}</th><th class="text-right-col">ยอด${step.step_name}</th>`;
+        });
+        html += `</tr>`;
+        thead.innerHTML = html;
+    }
+
+    function renderTable(data) {
+        const tbody = document.getElementById('reportTableBody');
+        tbody.innerHTML = '';
+
+        if (data.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="${5 + (allProductionSteps.length * 2)}" class="text-center text-muted py-4">ไม่พบข้อมูลที่ตรงกับเงื่อนไข</td></tr>`;
+            return;
+        }
+
+        data.forEach(order => {
+            let safeOrderNo = order.order_no || '-';
+            let workCode = workItemsMap[order.id_work] || order.id_work || '-';
+            let poNo = order.po_no || '-';
+            let orderQty = order.quantity || 0; 
+            let endDate = order.end_date ? order.end_date.split('T')[0] : '-';
+
+            let rowHtml = `<tr>`;
+            rowHtml += `<td><span class="order-link" onclick="openOrderPreview(${order.id_order})">${safeOrderNo}</span></td>`;
+            rowHtml += `<td>${workCode}</td>`;
+            rowHtml += `<td>${poNo}</td>`;
+            rowHtml += `<td class="text-right-col fw-bold">${orderQty.toLocaleString()}</td>`;
+            rowHtml += `<td>${endDate}</td>`;
+
+            allProductionSteps.forEach(step => {
+                let stepProduced = 0;
+                step.ids.forEach(stepId => {
+                    if (aggregatedProduction[order.id_order] && aggregatedProduction[order.id_order][stepId]) {
+                        stepProduced += aggregatedProduction[order.id_order][stepId];
+                    }
+                });
+
+                let pct = (orderQty > 0 && stepProduced > 0) ? ((stepProduced / orderQty) * 100).toFixed(1) : '-';
+                let pctClass = '';
+                if (pct !== '-') {
+                    let p = parseFloat(pct);
+                    if (p >= 100) pctClass = 'bg-status-green';
+                    else if (p >= 75) pctClass = 'bg-status-yellow';
+                    else if (p >= 30) pctClass = 'bg-status-orange';
+                    else pctClass = 'bg-status-red';
+                }
+
+                rowHtml += `<td class="text-center-col ${pctClass}">${pct !== '-' ? pct + '%' : '-'}</td>`;
+                rowHtml += `<td class="text-right-col">${stepProduced > 0 ? stepProduced.toLocaleString() : '-'}</td>`;
+            });
+
+            rowHtml += `</tr>`;
+            tbody.innerHTML += rowHtml;
+        });
+    }
+
+    function exportToExcel() {
+        const table = document.getElementById('statusReportTable');
+        if (!table) return;
+        const wb = XLSX.utils.table_to_book(table, { sheet: "Production Status" });
+        XLSX.writeFile(wb, "JAGUAR_PRODUCTION_STATUS.xlsx");
+    }
+</script>
+</body>
+</html>
